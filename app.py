@@ -619,3 +619,722 @@ with tabs[2]:
 # =========================================================
 # FIM DA PARTE 1  —  a Parte 2 continua daqui (abas 3 a 6)
 # =========================================================
+
+# =========================================================
+# app.py  —  PARTE 2 de 2  (cole logo abaixo do "FIM DA PARTE 1")
+# =========================================================
+
+STATUS_ORCAMENTO = "Orçamento (Aguardando Cliente)"
+STATUS_APROVADO = "Aprovado / Na fila"
+STATUS_LISTA = [
+    STATUS_ORCAMENTO,
+    STATUS_APROVADO,
+    "Imprimindo",
+    "Acabamento",
+    "Pronto para Entrega",
+    "Entregue",
+    "Cancelado",
+]
+STATUS_FILA = [STATUS_APROVADO, "Imprimindo"]
+STATUS_APROVADOS = [STATUS_APROVADO, "Imprimindo", "Acabamento", "Pronto para Entrega", "Entregue"]
+STATUS_IMPRESSOS = ["Acabamento", "Pronto para Entrega", "Entregue"]
+
+CANAIS = ["Instagram", "WhatsApp", "Vendedor Comissionado", "Shopee", "Mercado Livre", "Outro marketplace", "Outros"]
+CANAIS_MARKETPLACE = ["Shopee", "Mercado Livre", "Outro marketplace"]
+FORMAS_PGTO = ["PIX", "Dinheiro", "Cartão de crédito", "Cartão de débito", "Transferência", "Boleto", "Outro"]
+CATEGORIAS_CAIXA = [
+    "Compra de filamento", "Energia", "Embalagem", "Manutenção", "Despesa fixa",
+    "Marketing", "Outras saídas", "Venda avulsa", "Outras entradas",
+]
+
+# parte -> (campo do valor, campo da flag, origem no caixa, rótulo)
+PARTES = {
+    "entrada": ("entrada_valor", "entrada_paga", "entrada_50", "Entrada (50%)"),
+    "saldo": ("saldo_valor", "saldo_paga", "saldo_50", "Saldo (50%)"),
+}
+
+COLUNAS_NUM_PED = [
+    "quantidade", "horas_impressao", "custo", "receita_bruta", "desconto",
+    "valor_final", "entrada_valor", "saldo_valor", "comissao_pct", "taxa_fixa",
+]
+
+
+# ---------------------------------------------------------
+# FUNÇÕES DE APOIO (pedidos, estoque, caixa, WhatsApp)
+# ---------------------------------------------------------
+def normalizar_pedidos(df):
+    if df.empty:
+        return df
+    df = df.copy()
+    for c in COLUNAS_NUM_PED:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in ["entrada_paga", "saldo_paga", "estoque_baixado"]:
+        if c in df.columns:
+            df[c] = df[c].fillna(False).astype(bool)
+    return df
+
+
+def para_data(valor, padrao=None):
+    d = pd.to_datetime(valor, errors="coerce")
+    if pd.notna(d):
+        return d.date()
+    return padrao if padrao is not None else date.today()
+
+
+def data_br(valor):
+    d = pd.to_datetime(valor, errors="coerce")
+    if pd.isna(d):
+        return "a combinar"
+    return d.strftime("%d/%m/%Y")
+
+
+def calcular_50_50(valor_final):
+    entrada = round(float(valor_final) * 0.5, 2)
+    saldo = round(float(valor_final) - entrada, 2)
+    return entrada, saldo
+
+
+def status_pagamento_de(entrada_paga, saldo_paga):
+    if entrada_paga and saldo_paga:
+        return "Pago integralmente"
+    if entrada_paga:
+        return "Entrada paga (50%)"
+    if saldo_paga:
+        return "Saldo pago (50%)"
+    return "Pendente"
+
+
+def link_whatsapp(numero, mensagem):
+    digitos = "".join(c for c in str(numero) if c.isdigit())
+    if not digitos:
+        return ""
+    if len(digitos) in (10, 11):
+        digitos = "55" + digitos
+    return f"https://wa.me/{digitos}?text={urllib.parse.quote(mensagem)}"
+
+
+def faltas_estoque(usos, perda, df_rolos):
+    """Confere (na memória) se os rolos escolhidos têm saldo suficiente."""
+    if df_rolos.empty:
+        return []
+    precisa = {}
+    for rolo_id, gramas in usos:
+        precisa[rolo_id] = precisa.get(rolo_id, 0.0) + gramas * (1 + perda / 100.0)
+    mensagens = []
+    for rolo_id, total in precisa.items():
+        linha = df_rolos[df_rolos["id"] == rolo_id]
+        if not linha.empty:
+            saldo = num(linha.iloc[0]["saldo_g"])
+            if saldo < total:
+                mensagens.append(f"{txt(linha.iloc[0]['codigo'])}: saldo {saldo:.0f} g, precisa de {total:.0f} g")
+    return mensagens
+
+
+def verificar_estoque(pedido_id):
+    """Confere (no banco) se os rolos de um pedido já cadastrado têm saldo."""
+    problemas = []
+    usos = db.table("pedido_rolos").select("*").eq("pedido_id", pedido_id).execute().data
+    precisa = {}
+    for u in usos:
+        precisa[u["rolo_id"]] = precisa.get(u["rolo_id"], 0.0) + num(u["gramas_com_perda"])
+    for rolo_id, total in precisa.items():
+        rolo = db.table("rolos").select("codigo,cor_material,saldo_g").eq("id", rolo_id).execute().data
+        if rolo and num(rolo[0]["saldo_g"]) < total:
+            problemas.append(
+                f"Rolo {rolo[0]['codigo']} ({rolo[0]['cor_material']}): saldo {num(rolo[0]['saldo_g']):.0f} g, precisa de {total:.0f} g"
+            )
+    return problemas
+
+
+def baixar_estoque(pedido_id):
+    """Desconta o filamento UMA única vez (a flag estoque_baixado impede repetir)."""
+    reserva = (
+        db.table("pedidos").update({"estoque_baixado": True})
+        .eq("id", pedido_id).eq("estoque_baixado", False).execute()
+    )
+    if not reserva.data:
+        return "O estoque deste pedido já tinha sido baixado antes. Nada foi descontado de novo."
+    usos = db.table("pedido_rolos").select("*").eq("pedido_id", pedido_id).execute().data
+    for u in usos:
+        rolo = db.table("rolos").select("saldo_g").eq("id", u["rolo_id"]).execute().data
+        if rolo:
+            novo = max(0.0, num(rolo[0]["saldo_g"]) - num(u["gramas_com_perda"]))
+            db.table("rolos").update({"saldo_g": round(novo, 2)}).eq("id", u["rolo_id"]).execute()
+    return "Filamento baixado do estoque."
+
+
+def devolver_estoque(pedido_id):
+    reserva = (
+        db.table("pedidos").update({"estoque_baixado": False})
+        .eq("id", pedido_id).eq("estoque_baixado", True).execute()
+    )
+    if not reserva.data:
+        return ""
+    usos = db.table("pedido_rolos").select("*").eq("pedido_id", pedido_id).execute().data
+    for u in usos:
+        rolo = db.table("rolos").select("saldo_g").eq("id", u["rolo_id"]).execute().data
+        if rolo:
+            novo = num(rolo[0]["saldo_g"]) + num(u["gramas_com_perda"])
+            db.table("rolos").update({"saldo_g": round(novo, 2)}).eq("id", u["rolo_id"]).execute()
+    return "Filamento devolvido ao estoque."
+
+
+def mudar_status(ped, novo, forcar=False):
+    pid = int(ped["id"])
+    antigo = ped["status"]
+    if novo == antigo:
+        return False, "O pedido já está com esse status."
+    tem_pagamento = bool(ped["entrada_paga"]) or bool(ped["saldo_paga"])
+    if novo == STATUS_ORCAMENTO and tem_pagamento:
+        return False, "Este pedido já tem pagamento registrado. Desfaça a baixa do pagamento antes de voltar para Orçamento."
+    mensagens = []
+    if novo in STATUS_APROVADOS:
+        if not bool(ped["estoque_baixado"]):
+            problemas = verificar_estoque(pid)
+            if problemas and not forcar:
+                return False, "Estoque insuficiente: " + " | ".join(problemas) + ". Marque 'Aprovar mesmo assim' se quiser continuar."
+            mensagens.append(baixar_estoque(pid))
+    else:
+        if bool(ped["estoque_baixado"]):
+            devolvido = devolver_estoque(pid)
+            if devolvido:
+                mensagens.append(devolvido)
+        if novo == "Cancelado" and tem_pagamento:
+            mensagens.append("Atenção: pagamentos já lançados continuam no caixa. Se precisar, estorne-os em 'Corrigir lançamento errado'.")
+    db.table("pedidos").update({"status": novo}).eq("id", pid).execute()
+    return True, " ".join(m for m in mensagens if m) or "Status atualizado."
+
+
+def registrar_recebimento(ped, parte):
+    campo_valor, campo_flag, origem, rotulo = PARTES[parte]
+    pid = int(ped["id"])
+    if bool(ped[campo_flag]):
+        return False, f"{rotulo} já está registrado. Nada foi lançado de novo."
+    if ped["status"] not in STATUS_APROVADOS:
+        return False, "Aprove o orçamento antes de registrar pagamentos."
+    bruto = num(ped[campo_valor])
+    taxas = bruto * num(ped.get("comissao_pct")) / 100.0 + num(ped.get("taxa_fixa")) / 2.0
+    liquido = round(bruto - taxas, 2)
+    try:
+        db.table("fluxo_caixa").insert({
+            "data": date.today().isoformat(),
+            "tipo": "Entrada",
+            "categoria": "Venda",
+            "descricao": f"{rotulo} do pedido {txt(ped['codigo'])} ({txt(ped.get('cliente')) or 'sem nome'}) | bruto {brl(bruto)} - taxas do canal {brl(taxas)}",
+            "valor": liquido,
+            "pedido_id": pid,
+            "origem": origem,
+        }).execute()
+    except Exception as erro:
+        texto_erro = str(erro).lower()
+        if "duplicate" not in texto_erro and "23505" not in texto_erro:
+            return False, f"Não consegui lançar no caixa: {erro}"
+    entrada_paga = bool(ped["entrada_paga"]) or parte == "entrada"
+    saldo_paga = bool(ped["saldo_paga"]) or parte == "saldo"
+    db.table("pedidos").update({
+        campo_flag: True,
+        "status_pagamento": status_pagamento_de(entrada_paga, saldo_paga),
+    }).eq("id", pid).execute()
+    return True, f"{rotulo} registrado no caixa: {brl(liquido)} líquidos."
+
+
+def estornar_recebimento(ped, parte):
+    campo_valor, campo_flag, origem, rotulo = PARTES[parte]
+    pid = int(ped["id"])
+    if not bool(ped[campo_flag]):
+        return False, "Esse pagamento não está registrado."
+    db.table("fluxo_caixa").delete().eq("pedido_id", pid).eq("origem", origem).execute()
+    entrada_paga = bool(ped["entrada_paga"]) and parte != "entrada"
+    saldo_paga = bool(ped["saldo_paga"]) and parte != "saldo"
+    db.table("pedidos").update({
+        campo_flag: False,
+        "status_pagamento": status_pagamento_de(entrada_paga, saldo_paga),
+    }).eq("id", pid).execute()
+    return True, f"{rotulo} estornado. O lançamento foi removido do caixa."
+
+
+def montar_mensagem(ped):
+    marca = txt(cfg["nome_marca"])
+    eh_orcamento = ped["status"] == STATUS_ORCAMENTO
+    titulo = "ORÇAMENTO" if eh_orcamento else "PEDIDO CONFIRMADO"
+    cliente = txt(ped.get("cliente")) or "cliente"
+    linhas = [
+        f"*{marca}*",
+        f"*{titulo} {txt(ped['codigo'])}*",
+        "",
+        f"Olá, {cliente}!",
+        f"Item: {int(num(ped['quantidade']))}x {txt(ped.get('produto_nome'))}",
+    ]
+    if num(ped.get("desconto")) > 0:
+        linhas.append(f"Valor: {brl(ped['receita_bruta'])}")
+        linhas.append(f"Desconto: -{brl(ped['desconto'])}")
+    linhas.append(f"*Valor total: {brl(ped['valor_final'])}*")
+    linhas.append("")
+    pago_entrada = " ✅ pago" if bool(ped["entrada_paga"]) else ""
+    pago_saldo = " ✅ pago" if bool(ped["saldo_paga"]) else ""
+    linhas.append(f"Entrada (50%): {brl(ped['entrada_valor'])}{pago_entrada}")
+    linhas.append(f"Chave PIX: {txt(cfg['chave_pix'])}")
+    linhas.append(f"Saldo (50%) na entrega: {brl(ped['saldo_valor'])}{pago_saldo}")
+    linhas.append("")
+    linhas.append(f"Previsão de entrega: {data_br(ped.get('previsao_entrega'))}")
+    linhas.append("")
+    linhas.append(f"Obrigado pela preferência! 💜 {marca}")
+    return "\n".join(linhas)
+
+
+# =========================================================
+# ABA 3 — ESTOQUE DE FILAMENTOS
+# =========================================================
+with tabs[3]:
+    st.subheader("🧵 Estoque de Filamentos")
+    st.caption("O saldo só diminui quando um pedido é aprovado (sai de 'Orçamento').")
+    df_r = ler("rolos", "codigo")
+
+    if df_r.empty:
+        st.info("Nenhum rolo cadastrado ainda. Use o formulário abaixo.")
+    else:
+        for coluna in ["peso_inicial_g", "saldo_g", "custo_rolo", "limite_minimo_g"]:
+            df_r[coluna] = pd.to_numeric(df_r[coluna], errors="coerce").fillna(0.0)
+        baixos = df_r[df_r["saldo_g"] <= df_r["limite_minimo_g"]]
+        if not baixos.empty:
+            st.error(
+                "⚠️ Estoque baixo: "
+                + ", ".join(f"{txt(x.codigo)} ({txt(x.cor_material)}) com {x.saldo_g:.0f} g" for x in baixos.itertuples())
+            )
+        for _, rolo in df_r.iterrows():
+            baixo = rolo["saldo_g"] <= rolo["limite_minimo_g"]
+            with st.container(border=True):
+                st.markdown(f"{'🔴' if baixo else '🟢'} **{txt(rolo['codigo'])} — {txt(rolo['cor_material'])}**")
+                fracao = rolo["saldo_g"] / rolo["peso_inicial_g"] if rolo["peso_inicial_g"] > 0 else 0.0
+                st.progress(min(max(fracao, 0.0), 1.0))
+                custo_kg = rolo["custo_rolo"] / (rolo["peso_inicial_g"] / 1000.0) if rolo["peso_inicial_g"] > 0 else 0.0
+                st.caption(
+                    f"Saldo: {rolo['saldo_g']:.0f} g de {rolo['peso_inicial_g']:.0f} g  |  "
+                    f"alerta abaixo de {rolo['limite_minimo_g']:.0f} g  |  {brl(custo_kg)}/kg"
+                )
+                if baixo:
+                    st.warning("Estoque baixo: hora de comprar este filamento.")
+        botao_baixar(df_r, "estoque_filamentos", "bkp_estoque")
+
+    st.divider()
+    st.markdown("#### ➕ Cadastrar rolo ou ✏️ editar")
+    opcoes_rolo = ["➕ Novo rolo"]
+    if not df_r.empty:
+        opcoes_rolo += [f"{txt(x.codigo)} — {txt(x.cor_material)}" for x in df_r.itertuples()]
+    escolha_rolo = st.selectbox("O que você quer fazer?", opcoes_rolo, key="rolo_escolha")
+    editando_rolo = escolha_rolo != opcoes_rolo[0]
+    atual_rolo = {}
+    if editando_rolo:
+        cod_rolo = escolha_rolo.split(" — ")[0]
+        achado_rolo = df_r[df_r["codigo"].astype(str) == cod_rolo]
+        if not achado_rolo.empty:
+            atual_rolo = achado_rolo.iloc[0].to_dict()
+
+    with st.form(f"form_rolo_{escolha_rolo}"):
+        r_cod = st.text_input("Código do rolo", value=txt(atual_rolo.get("codigo")), disabled=editando_rolo, key=f"r_cod_{escolha_rolo}")
+        r_cor = st.text_input("Cor / Material (ex.: PLA Preto)", value=txt(atual_rolo.get("cor_material")), key=f"r_cor_{escolha_rolo}")
+        r_peso = st.number_input("Peso inicial (g)", min_value=1.0, value=num(atual_rolo.get("peso_inicial_g"), 1000.0), step=50.0, key=f"r_peso_{escolha_rolo}")
+        r_custo = st.number_input("Custo do rolo (R$)", min_value=0.0, value=num(atual_rolo.get("custo_rolo")), step=5.0, format="%.2f", key=f"r_custo_{escolha_rolo}")
+        r_lim = st.number_input("Alerta quando o saldo ficar abaixo de (g)", min_value=0.0, value=num(atual_rolo.get("limite_minimo_g"), f("estoque_minimo_g")), step=10.0, key=f"r_lim_{escolha_rolo}")
+        r_saldo = num(atual_rolo.get("saldo_g"))
+        if editando_rolo:
+            r_saldo = st.number_input("Saldo atual (g) — use para corrigir a contagem", min_value=0.0, value=num(atual_rolo.get("saldo_g")), step=10.0, key=f"r_saldo_{escolha_rolo}")
+        confirma_rolo = False
+        if editando_rolo:
+            confirma_rolo = st.checkbox("Marque para confirmar a exclusão deste rolo", key=f"r_conf_{escolha_rolo}")
+        rb1, rb2 = st.columns(2)
+        salvar_rolo = rb1.form_submit_button("💾 Salvar rolo", use_container_width=True, type="primary")
+        excluir_rolo = rb2.form_submit_button("🗑️ Excluir rolo", use_container_width=True, disabled=not editando_rolo)
+
+    if salvar_rolo:
+        if not r_cor.strip() or (not editando_rolo and not r_cod.strip()):
+            st.error("Preencha o código e a cor/material.")
+        elif (not editando_rolo) and (not df_r.empty) and (df_r["codigo"].astype(str) == r_cod.strip()).any():
+            st.error("Já existe um rolo com esse código. Escolha outro código ou edite o existente.")
+        else:
+            try:
+                if editando_rolo:
+                    db.table("rolos").update({
+                        "cor_material": r_cor.strip(),
+                        "peso_inicial_g": r_peso,
+                        "custo_rolo": r_custo,
+                        "limite_minimo_g": r_lim,
+                        "saldo_g": r_saldo,
+                    }).eq("codigo", txt(atual_rolo.get("codigo"))).execute()
+                else:
+                    db.table("rolos").insert({
+                        "codigo": r_cod.strip(),
+                        "cor_material": r_cor.strip(),
+                        "peso_inicial_g": r_peso,
+                        "saldo_g": r_peso,
+                        "custo_rolo": r_custo,
+                        "limite_minimo_g": r_lim,
+                    }).execute()
+                st.toast("✅ Rolo salvo!")
+                st.rerun()
+            except Exception as erro:
+                st.error(f"Não consegui salvar: {erro}")
+
+    if excluir_rolo:
+        if not confirma_rolo:
+            st.warning("Marque a caixinha de confirmação antes de excluir.")
+        else:
+            try:
+                db.table("rolos").delete().eq("codigo", txt(atual_rolo.get("codigo"))).execute()
+                st.toast("🗑️ Rolo excluído.")
+                st.rerun()
+            except Exception:
+                st.error("Não foi possível excluir: este rolo já foi usado em algum pedido. Para parar de usá-lo, zere o saldo.")
+
+
+# =========================================================
+# ABA 4 — PEDIDOS, ORÇAMENTOS, FILA, CRM, EDIÇÃO RÁPIDA E WHATSAPP
+# =========================================================
+with tabs[4]:
+    st.subheader("📋 Pedidos e Orçamentos")
+
+    if "flash" in st.session_state:
+        st.success(st.session_state.pop("flash"))
+
+    df_ped = normalizar_pedidos(ler("pedidos", "criado_em", True))
+    df_prod2 = ler("produtos", "codigo")
+    df_rolos2 = ler("rolos", "codigo")
+    if not df_rolos2.empty:
+        df_rolos2["saldo_g"] = pd.to_numeric(df_rolos2["saldo_g"], errors="coerce").fillna(0.0)
+
+    # ---------- Indicador de capacidade / fila de produção ----------
+    horas_fila = 0.0
+    qtd_fila = 0
+    if not df_ped.empty:
+        na_fila = df_ped[df_ped["status"].isin(STATUS_FILA)]
+        horas_fila = num(na_fila["horas_impressao"].sum())
+        qtd_fila = len(na_fila)
+    horas_por_dia = max(f("horas_dia"), 1.0)
+    dias_fila = math.ceil(horas_fila / horas_por_dia) if horas_fila > 0 else 0
+    hf, mf = decimal_para_hm(horas_fila)
+    st.markdown(
+        f'<div class="cartao"><b>⏱️ Fila de produção</b><br>'
+        f'<span style="font-size:1.5rem"><b>{hf}h{mf:02d}min</b></span> de impressão em '
+        f"<b>{qtd_fila}</b> pedido(s) aprovado(s)<br>"
+        f"Estimativa: <b>{dias_fila} dia(s)</b> de trabalho ({horas_por_dia:.0f} h por dia)</div>",
+        unsafe_allow_html=True,
+    )
+
+    V_LISTA = "📋 Lista"
+    V_NOVO = "➕ Novo"
+    V_EDIT = "⚡ Edição rápida + WhatsApp"
+    V_CRM = "👥 Clientes"
+    visao = st.radio("O que você quer fazer?", [V_LISTA, V_NOVO, V_EDIT, V_CRM], horizontal=True, key="ped_visao")
+
+    # =====================================================
+    # VISÃO: LISTA
+    # =====================================================
+    if visao == V_LISTA:
+        if df_ped.empty:
+            st.info("Nenhum pedido ainda. Escolha '➕ Novo' para criar o primeiro orçamento.")
+        else:
+            n_orc = int((df_ped["status"] == STATUS_ORCAMENTO).sum())
+            st.caption(f"{len(df_ped)} registro(s) no total | {n_orc} orçamento(s) aguardando cliente")
+            filtro_status = st.multiselect("Filtrar por status", STATUS_LISTA, default=[], key="ped_filtro")
+            vis_ped = df_ped if not filtro_status else df_ped[df_ped["status"].isin(filtro_status)]
+            colunas_ped = {
+                "codigo": "Código", "cliente": "Cliente", "produto_nome": "Produto", "quantidade": "Qtd",
+                "status": "Status", "valor_final": "Valor final (R$)", "status_pagamento": "Pagamento",
+                "previsao_entrega": "Entrega prevista", "canal": "Canal",
+            }
+            st.dataframe(vis_ped[list(colunas_ped.keys())].rename(columns=colunas_ped), use_container_width=True, hide_index=True)
+            botao_baixar(df_ped, "pedidos", "bkp_pedidos")
+
+    # =====================================================
+    # VISÃO: NOVO ORÇAMENTO / PEDIDO
+    # =====================================================
+    elif visao == V_NOVO:
+        k = st.session_state.get("ped_n", 0)
+        st.caption("Orçamento não baixa filamento, não ocupa a fila e não lança caixa. Isso só acontece quando você aprovar.")
+
+        cod_ped = st.text_input("Código do pedido", value=f"PED-{len(df_ped) + 1:04d}", key=f"ped_cod_{k}")
+
+        opcoes_produto = ["— Sem produto cadastrado (digitar à mão) —"]
+        if not df_prod2.empty:
+            opcoes_produto += [f"{txt(x.codigo)} — {txt(x.descricao)}" for x in df_prod2.itertuples()]
+        sel_prod = st.selectbox("Produto", opcoes_produto, key=f"ped_prod_{k}")
+        prod = {}
+        if sel_prod != opcoes_produto[0]:
+            cod_p = sel_prod.split(" — ")[0]
+            achado_p = df_prod2[df_prod2["codigo"].astype(str) == cod_p]
+            if not achado_p.empty:
+                prod = achado_p.iloc[0].to_dict()
+        if prod:
+            nome_produto = txt(prod.get("descricao"))
+        else:
+            nome_produto = st.text_input("Descrição do item", key=f"ped_nome_{k}")
+
+        qtd = st.number_input("Quantidade / lote", min_value=1, value=1, step=1, key=f"ped_qtd_{k}")
+        sufixo = f"{k}_{sel_prod}_{qtd}"
+
+        # ----- Filamentos (1 a 4 cores/rolos) -----
+        st.markdown("**Filamentos usados**")
+        mapa_rolos = {}
+        for x in df_rolos2.itertuples():
+            mapa_rolos[f"{txt(x.codigo)} — {txt(x.cor_material)} ({num(x.saldo_g):.0f} g)"] = int(x.id)
+        if not mapa_rolos:
+            st.warning("Nenhum rolo cadastrado: o pedido será salvo sem controle de filamento. Cadastre rolos na aba Estoque.")
+        n_cores_p = st.selectbox("Quantas cores/rolos neste pedido?", [1, 2, 3, 4], key=f"ped_ncores_{k}")
+        perda_p = st.number_input("Perda técnica (%)", min_value=0.0, max_value=100.0, value=f("perda_pct"), step=1.0, key=f"ped_perda_{k}")
+        g_sugerida = num(prod.get("gramatura_g")) * int(qtd)
+        usos = []
+        for i in range(n_cores_p):
+            cc1, cc2 = st.columns([3, 2])
+            rolo_escolhido = None
+            if mapa_rolos:
+                rolo_escolhido = cc1.selectbox(f"Rolo / cor {i + 1}", list(mapa_rolos.keys()), key=f"ped_rolo{i}_{k}")
+            gramas_cor = cc2.number_input(
+                f"Gramas (g) da cor {i + 1}", min_value=0.0,
+                value=float(round(g_sugerida, 1)) if i == 0 else 0.0,
+                step=1.0, key=f"ped_g{i}_{sufixo}",
+            )
+            if rolo_escolhido and gramas_cor > 0:
+                usos.append((mapa_rolos[rolo_escolhido], gramas_cor))
+        st.caption("As gramas são o total do pedido (todas as peças). A perda técnica é somada na baixa do estoque.")
+
+        # ----- Tempo -----
+        h_def, m_def = decimal_para_hm(num(prod.get("tempo_horas")) * int(qtd))
+        th1, th2 = st.columns(2)
+        horas_h = th1.number_input("Tempo total de impressão: horas", min_value=0, value=int(h_def), step=1, key=f"ped_h_{sufixo}")
+        horas_m = th2.number_input("minutos (0 a 59)", min_value=0, max_value=59, value=int(m_def), step=1, key=f"ped_m_{sufixo}")
+        horas_total = hm_para_decimal(horas_h, horas_m)
+
+        # ----- Valores -----
+        st.markdown("**Valores**")
+        custo_in = st.number_input("Custo (R$)", min_value=0.0, value=float(round(num(prod.get("custo_unit")) * int(qtd), 2)), step=1.0, format="%.2f", key=f"ped_custo_{sufixo}")
+        receita_in = st.number_input("Receita bruta (R$)", min_value=0.0, value=float(round(num(prod.get("preco_direto")) * int(qtd), 2)), step=1.0, format="%.2f", key=f"ped_receita_{sufixo}")
+        dd1, dd2 = st.columns(2)
+        tipo_desc = dd1.radio("Tipo de desconto", ["R$", "%"], horizontal=True, key=f"ped_tdesc_{k}")
+        valor_desc = dd2.number_input("Desconto", min_value=0.0, value=0.0, step=1.0, key=f"ped_vdesc_{k}")
+        desconto_rs = valor_desc if tipo_desc == "R$" else receita_in * valor_desc / 100.0
+        desconto_rs = min(desconto_rs, receita_in)
+        valor_final = round(receita_in - desconto_rs, 2)
+        entrada_v, saldo_v = calcular_50_50(valor_final)
+
+        # ----- Canal e comissão -----
+        canal = st.selectbox("Local da venda", CANAIS, key=f"ped_canal_{k}")
+        eh_mkt = canal in CANAIS_MARKETPLACE
+        cm1, cm2 = st.columns(2)
+        com_pct = cm1.number_input("Comissão do local (%)", min_value=0.0, max_value=99.0, value=f("mkt_comissao_pct") if eh_mkt else 0.0, step=1.0, key=f"ped_com_{k}_{canal}")
+        taxa_fixa = cm2.number_input("Taxa fixa do local (R$)", min_value=0.0, value=f("mkt_taxa_fixa") if eh_mkt else 0.0, step=0.5, key=f"ped_taxa_{k}_{canal}")
+
+        st.markdown(
+            f'<div class="cartao"><b>Valor cobrado final: {brl(valor_final)}</b><br>'
+            f"Entrada (50%): {brl(entrada_v)} | Saldo (50%) na entrega: {brl(saldo_v)}</div>",
+            unsafe_allow_html=True,
+        )
+        lucro_previsto = valor_final - custo_in - (valor_final * com_pct / 100.0 + taxa_fixa)
+        if lucro_previsto < 0:
+            st.error(f"⚠️ Margem negativa: este pedido daria prejuízo de {brl(abs(lucro_previsto))}. Revise custo, desconto ou comissão.")
+        else:
+            st.caption(f"Lucro previsto: {brl(lucro_previsto)}")
+
+        # ----- Datas, status e cliente -----
+        dias_prev = math.ceil((horas_fila + horas_total) / horas_por_dia) if (horas_fila + horas_total) > 0 else 1
+        prev_padrao = date.today() + timedelta(days=max(dias_prev, 1))
+        dt1, dt2 = st.columns(2)
+        data_ped = dt1.date_input("Data do pedido", value=date.today(), key=f"ped_data_{k}")
+        previsao = dt2.date_input("Previsão de entrega (sugerida pela fila)", value=prev_padrao, key=f"ped_prev_{sufixo}_{horas_total}")
+
+        status_novo = st.selectbox("Status do pedido", STATUS_LISTA, index=0, key=f"ped_status_{k}")
+        cliente = st.text_input("Nome do cliente", key=f"ped_cli_{k}")
+        whatsapp = st.text_input("WhatsApp do cliente (com DDD, ex.: 73 99999-9999)", key=f"ped_wpp_{k}")
+        forma = st.selectbox("Forma de pagamento", FORMAS_PGTO, key=f"ped_forma_{k}")
+        responsavel = st.text_input("Responsável pela produção", key=f"ped_resp_{k}")
+        obs = st.text_area("Observações", key=f"ped_obs_{k}")
+
+        forcar_novo = False
+        faltas = []
+        if status_novo in STATUS_APROVADOS:
+            faltas = faltas_estoque(usos, perda_p, df_rolos2)
+            if not usos:
+                st.warning("Nenhum filamento informado: nada será descontado do estoque.")
+            if faltas:
+                st.error("Estoque insuficiente: " + " | ".join(faltas))
+                forcar_novo = st.checkbox("Salvar mesmo assim (o rolo ficará zerado)", key=f"ped_forcar_{k}")
+
+        if st.button("💾 Salvar orçamento / pedido", type="primary", use_container_width=True, key=f"ped_salvar_{k}"):
+            codigo_final = cod_ped.strip()
+            if not codigo_final:
+                st.error("Informe o código do pedido.")
+            elif not nome_produto.strip():
+                st.error("Informe o produto/item.")
+            elif (not df_ped.empty) and (df_ped["codigo"].astype(str) == codigo_final).any():
+                st.error("Já existe um pedido com esse código. Escolha outro.")
+            elif faltas and not forcar_novo:
+                st.error("Marque 'Salvar mesmo assim' ou corrija os rolos/gramas.")
+            else:
+                pid_novo = None
+                try:
+                    resposta = db.table("pedidos").insert({
+                        "codigo": codigo_final,
+                        "produto_id": int(prod["id"]) if prod else None,
+                        "produto_nome": nome_produto.strip(),
+                        "quantidade": int(qtd),
+                        "horas_impressao": round(horas_total, 4),
+                        "custo": round(custo_in, 2),
+                        "receita_bruta": round(receita_in, 2),
+                        "desconto": round(desconto_rs, 2),
+                        "valor_final": valor_final,
+                        "data_pedido": data_ped.isoformat(),
+                        "previsao_entrega": previsao.isoformat(),
+                        "status": status_novo,
+                        "cliente": cliente.strip(),
+                        "whatsapp": whatsapp.strip(),
+                        "forma_pagamento": forma,
+                        "status_pagamento": "Pendente",
+                        "entrada_valor": entrada_v,
+                        "entrada_paga": False,
+                        "saldo_valor": saldo_v,
+                        "saldo_paga": False,
+                        "responsavel": responsavel.strip(),
+                        "canal": canal,
+                        "comissao_pct": com_pct,
+                        "taxa_fixa": taxa_fixa,
+                        "observacoes": obs.strip(),
+                        "estoque_baixado": False,
+                    }).execute()
+                    pid_novo = resposta.data[0]["id"]
+                    if usos:
+                        db.table("pedido_rolos").insert([
+                            {
+                                "pedido_id": pid_novo,
+                                "rolo_id": rolo_id,
+                                "gramas_liquidas": gramas,
+                                "gramas_com_perda": round(gramas * (1 + perda_p / 100.0), 2),
+                            }
+                            for rolo_id, gramas in usos
+                        ]).execute()
+                    aviso = "Orçamento salvo. Nada foi descontado do estoque."
+                    if status_novo in STATUS_APROVADOS:
+                        aviso = "Pedido salvo. " + baixar_estoque(pid_novo)
+                    st.session_state["flash"] = aviso
+                    st.session_state["ped_n"] = k + 1
+                    st.session_state["ped_visao"] = V_LISTA
+                    st.rerun()
+                except Exception as erro:
+                    if pid_novo is not None:
+                        try:
+                            db.table("pedidos").delete().eq("id", pid_novo).execute()
+                        except Exception:
+                            pass
+                    st.error(f"Não consegui salvar o pedido: {erro}")
+
+    # =====================================================
+    # VISÃO: EDIÇÃO RÁPIDA + RECIBO WHATSAPP
+    # =====================================================
+    elif visao == V_EDIT:
+        if df_ped.empty:
+            st.info("Nenhum pedido para editar ainda.")
+        else:
+            rotulos_ped = {}
+            for x in df_ped.itertuples():
+                rotulos_ped[f"{txt(x.codigo)} — {txt(x.cliente) or 'sem cliente'} — {txt(x.status)}"] = int(x.id)
+            escolha_ped = st.selectbox("Escolha o pedido ou orçamento", list(rotulos_ped.keys()), key="ed_pedido")
+            pid = rotulos_ped[escolha_ped]
+            ped = df_ped[df_ped["id"] == pid].iloc[0].to_dict()
+
+            st.markdown(
+                f'<div class="cartao"><b>{html.escape(txt(ped["codigo"]))}</b> — {html.escape(txt(ped.get("cliente")) or "sem cliente")}<br>'
+                f'Item: {int(num(ped["quantidade"]))}x {html.escape(txt(ped.get("produto_nome")))}<br>'
+                f'Status: <b>{html.escape(txt(ped["status"]))}</b> | Pagamento: <b>{html.escape(txt(ped.get("status_pagamento")))}</b><br>'
+                f'Valor final: <b>{brl(ped["valor_final"])}</b> | Estoque baixado: <b>{"sim" if ped["estoque_baixado"] else "não"}</b></div>',
+                unsafe_allow_html=True,
+            )
+
+            # ----- Status -----
+            st.markdown("#### 1) Atualizar status")
+            indice_status = STATUS_LISTA.index(ped["status"]) if ped["status"] in STATUS_LISTA else 0
+            novo_status = st.selectbox("Novo status", STATUS_LISTA, index=indice_status, key=f"ed_status_{pid}")
+            forcar_ed = st.checkbox("Aprovar mesmo assim se faltar filamento (o rolo ficará zerado)", key=f"ed_forcar_{pid}")
+            if st.button("✅ Atualizar status", use_container_width=True, type="primary", key=f"ed_btn_status_{pid}"):
+                try:
+                    ok, msg = mudar_status(ped, novo_status, forcar_ed)
+                    if ok:
+                        st.session_state["flash"] = msg
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                except Exception as erro:
+                    st.error(f"Não consegui atualizar: {erro}")
+
+            # ----- Pagamentos 50/50 -----
+            st.markdown("#### 2) Pagamentos (50% + 50%)")
+            aprovado = ped["status"] in STATUS_APROVADOS
+            if not aprovado:
+                st.info("Os pagamentos só podem ser registrados depois que o orçamento for aprovado.")
+            bp1, bp2 = st.columns(2)
+            with bp1:
+                st.markdown(f"**Entrada (50%)**: {brl(ped['entrada_valor'])}  \n{'✅ paga' if ped['entrada_paga'] else '⏳ pendente'}")
+                if st.button("💵 Dar baixa na ENTRADA", use_container_width=True, disabled=(not aprovado) or bool(ped["entrada_paga"]), key=f"ed_pg_ent_{pid}"):
+                    try:
+                        ok, msg = registrar_recebimento(ped, "entrada")
+                        if ok:
+                            st.session_state["flash"] = msg
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    except Exception as erro:
+                        st.error(f"Erro: {erro}")
+            with bp2:
+                st.markdown(f"**Saldo (50%) na entrega**: {brl(ped['saldo_valor'])}  \n{'✅ pago' if ped['saldo_paga'] else '⏳ pendente'}")
+                if st.button("💵 Dar baixa no SALDO", use_container_width=True, disabled=(not aprovado) or bool(ped["saldo_paga"]), key=f"ed_pg_sal_{pid}"):
+                    try:
+                        ok, msg = registrar_recebimento(ped, "saldo")
+                        if ok:
+                            st.session_state["flash"] = msg
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    except Exception as erro:
+                        st.error(f"Erro: {erro}")
+
+            with st.expander("↩️ Corrigir lançamento errado (estornar pagamento)"):
+                st.caption("Remove o lançamento do caixa e volta o pagamento para 'pendente'.")
+                ex1, ex2 = st.columns(2)
+                if ex1.button("Estornar ENTRADA", use_container_width=True, disabled=not bool(ped["entrada_paga"]), key=f"ed_est_ent_{pid}"):
+                    try:
+                        ok, msg = estornar_recebimento(ped, "entrada")
+                        st.session_state["flash"] = msg
+                        st.rerun()
+                    except Exception as erro:
+                        st.error(f"Erro: {erro}")
+                if ex2.button("Estornar SALDO", use_container_width=True, disabled=not bool(ped["saldo_paga"]), key=f"ed_est_sal_{pid}"):
+                    try:
+                        ok, msg = estornar_recebimento(ped, "saldo")
+                        st.session_state["flash"] = msg
+                        st.rerun()
+                    except Exception as erro:
+                        st.error(f"Erro: {erro}")
+
+            # ----- Recibo / WhatsApp -----
+            st.markdown("#### 3) Orçamento / Recibo para WhatsApp")
+            mensagem = montar_mensagem(ped)
+            st.caption("Toque no ícone de copiar no canto da caixa abaixo:")
+            st.code(mensagem, language=None)
+            url_wpp = link_whatsapp(ped.get("whatsapp"), mensagem)
+            if url_wpp:
+                st.link_button("📲 Abrir conversa no WhatsApp do cliente", url_wpp, use_container_width=True)
+            else:
+                st.info("Este pedido não tem WhatsApp do cliente. Cadastre em 'Editar dados do pedido' para ativar o botão direto.")
+
+            # ----- Editar dados -----
+            with st.expander("✏️ Editar dados do pedido (cliente, WhatsApp, previsão, observações)"):
+                with st.form(f"form_edit_{pid}"):
+                    e_cli = st.text_input("Nome do cliente", value=txt(ped.get("cliente")), key=f"e_cli_{pid}")
+                    e_wpp = st.text_input("WhatsApp (com DDD)", value=txt(ped.get("whatsapp")), key=f"e_wpp_{pid}")
+                    e_prev = st.date_input("Previsão de entrega", value=para_data(ped.get("previsao_entrega")), key=f"e_prev_{pid}")
+                    e_resp = st.text_input("Responsável pela produção", value=txt(ped.get("responsavel")), key=f"e_resp_{pid}")
+                    forma_atual = txt(ped.get("forma_pagamento"))
+                    e_forma = st.selectbox("Forma de pagamento", FORMAS_PGTO, index=FORMAS_PGTO.index(forma_atual) if forma_atual in FORMAS_PGTO else 0, key=f"e_forma_{pid}")
+                    e_obs = st.text_area("Observações", value=txt(ped.get("observacoes")), key=f"e_obs_{pid}")
+                    salvar_edicao = st.form_submit_button("💾 Salvar alterações", use_container_width=True)
+                if salvar_edicao:
+                    try:
+                        db.table("pedidos").update({
