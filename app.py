@@ -49,16 +49,27 @@ if not tela_login():
 # ---------------------------------------------------------
 # CONEXÃO COM O SUPABASE (SUPABASE_URL e SUPABASE_KEY em Secrets)
 # ---------------------------------------------------------
+def limpar_url(valor):
+    u = str(valor).strip().strip('"').strip("'").strip()
+    marcador = ".supabase.co"
+    if marcador in u:
+        u = u.split(marcador)[0] + marcador
+    return u
+
+
 @st.cache_resource
-def conectar():
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+def conectar(url, chave):
+    return create_client(url, chave)
 
 
 try:
-    db = conectar()
+    URL_LIMPA = limpar_url(st.secrets["SUPABASE_URL"])
+    db = conectar(URL_LIMPA, str(st.secrets["SUPABASE_KEY"]).strip())
 except Exception:
     st.error("Não consegui conectar ao Supabase. Confira SUPABASE_URL e SUPABASE_KEY em Secrets.")
     st.stop()
+
+st.caption(f"🔧 Teste de conexão. Endereço usado: {URL_LIMPA}")
 
 
 # ---------------------------------------------------------
