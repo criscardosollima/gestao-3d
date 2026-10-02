@@ -69,7 +69,6 @@ except Exception:
     st.error("Não consegui conectar ao Supabase. Confira SUPABASE_URL e SUPABASE_KEY em Secrets.")
     st.stop()
 
-st.caption(f"🔧 Teste de conexão. Endereço usado: {URL_LIMPA}")
 
 
 # ---------------------------------------------------------
