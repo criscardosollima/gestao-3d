@@ -1389,3 +1389,226 @@ with tabs[4]:
                 exibir_crm["Total gasto (R$)"] = exibir_crm["Total gasto (R$)"].apply(brl)
                 st.dataframe(exibir_crm, use_container_width=True, hide_index=True)
                 botao_baixar(crm, "clientes", "bkp_clientes")
+
+
+
+# =========================================================
+# ABA 5 — CUSTOS E RECEBIMENTOS (FLUXO DE CAIXA)
+# =========================================================
+with tabs[5]:
+    st.subheader("💰 Custos e Recebimentos (Fluxo de Caixa)")
+    st.caption("Entradas de pedidos entram aqui sozinhas quando você dá baixa nos 50% (já descontando comissão/taxa do canal).")
+
+    df_cx = ler("fluxo_caixa", "data", True)
+    df_ped_cx = normalizar_pedidos(ler("pedidos"))
+
+    cp1, cp2 = st.columns(2)
+    ini_cx = cp1.date_input("De", value=date.today().replace(day=1), key="cx_ini")
+    fim_cx = cp2.date_input("Até", value=date.today(), key="cx_fim")
+
+    a_receber = 0.0
+    if not df_ped_cx.empty:
+        ap = df_ped_cx[df_ped_cx["status"].isin(STATUS_APROVADOS)]
+        a_receber = (
+            ap["entrada_valor"].where(~ap["entrada_paga"], 0.0)
+            + ap["saldo_valor"].where(~ap["saldo_paga"], 0.0)
+        ).sum()
+
+    vis_cx = pd.DataFrame()
+    if not df_cx.empty:
+        df_cx["valor"] = pd.to_numeric(df_cx["valor"], errors="coerce").fillna(0.0)
+        df_cx["data"] = pd.to_datetime(df_cx["data"], errors="coerce").dt.date
+        vis_cx = df_cx[(df_cx["data"] >= ini_cx) & (df_cx["data"] <= fim_cx)]
+
+    entradas_cx = vis_cx.loc[vis_cx["tipo"] == "Entrada", "valor"].sum() if not vis_cx.empty else 0.0
+    saidas_cx = vis_cx.loc[vis_cx["tipo"] == "Saída", "valor"].sum() if not vis_cx.empty else 0.0
+    cm1, cm2 = st.columns(2)
+    cm1.metric("Entradas (líquidas)", brl(entradas_cx))
+    cm2.metric("Saídas", brl(saidas_cx))
+    cm3, cm4 = st.columns(2)
+    cm3.metric("Saldo do período", brl(entradas_cx - saidas_cx))
+    cm4.metric("A receber (50% pendentes, bruto)", brl(a_receber))
+
+    st.markdown("#### ➕ Novo lançamento manual")
+    with st.form("form_caixa", clear_on_submit=True):
+        c_data = st.date_input("Data", value=date.today())
+        c_tipo = st.radio("Tipo", ["Saída", "Entrada"], horizontal=True)
+        c_cat = st.selectbox("Categoria", CATEGORIAS_CAIXA)
+        c_desc = st.text_input("Descrição (ex.: Rolo PLA preto 1kg)")
+        c_valor = st.number_input("Valor (R$)", min_value=0.01, value=10.0, step=1.0, format="%.2f")
+        salvar_cx = st.form_submit_button("💾 Lançar", use_container_width=True, type="primary")
+    if salvar_cx:
+        try:
+            db.table("fluxo_caixa").insert({
+                "data": c_data.isoformat(),
+                "tipo": c_tipo,
+                "categoria": c_cat,
+                "descricao": c_desc.strip(),
+                "valor": c_valor,
+                "origem": "manual",
+            }).execute()
+            st.toast("✅ Lançamento salvo!")
+            st.rerun()
+        except Exception as erro:
+            st.error(f"Não consegui lançar: {erro}")
+
+    st.markdown("#### Extrato do período")
+    if vis_cx.empty:
+        st.info("Nenhum lançamento neste período.")
+    else:
+        exibir_cx = vis_cx[["data", "tipo", "categoria", "descricao", "valor"]].copy()
+        exibir_cx["valor"] = exibir_cx["valor"].apply(brl)
+        exibir_cx.columns = ["Data", "Tipo", "Categoria", "Descrição", "Valor"]
+        st.dataframe(exibir_cx, use_container_width=True, hide_index=True)
+
+        manuais = vis_cx[vis_cx["origem"] == "manual"]
+        if not manuais.empty:
+            with st.expander("🗑️ Excluir lançamento manual"):
+                rotulos_cx = {
+                    f"{x.data} | {x.tipo} | {txt(x.categoria)} | {brl(x.valor)} | {txt(x.descricao)}": int(x.id)
+                    for x in manuais.itertuples()
+                }
+                escolha_cx = st.selectbox("Escolha o lançamento", list(rotulos_cx.keys()), key="cx_del_sel")
+                confirma_cx = st.checkbox("Confirmo a exclusão", key="cx_del_conf")
+                if st.button("Excluir lançamento", disabled=not confirma_cx, key="cx_del_btn"):
+                    try:
+                        db.table("fluxo_caixa").delete().eq("id", rotulos_cx[escolha_cx]).execute()
+                        st.toast("🗑️ Lançamento excluído.")
+                        st.rerun()
+                    except Exception as erro:
+                        st.error(f"Não consegui excluir: {erro}")
+        st.caption("Lançamentos de pedidos não aparecem para exclusão aqui. Para desfazer, use 'Estornar' na aba Pedidos.")
+
+    botao_baixar(df_cx, "fluxo_de_caixa", "bkp_caixa")
+
+
+# =========================================================
+# ABA 6 — RELATÓRIO, PONTO DE EQUILÍBRIO E META MENSAL
+# =========================================================
+with tabs[6]:
+    st.subheader("📊 Relatório Financeiro")
+    rp1, rp2 = st.columns(2)
+    ini_r = rp1.date_input("Data inicial", value=date.today().replace(day=1), key="rel_ini")
+    fim_r = rp2.date_input("Data final", value=date.today(), key="rel_fim")
+
+    if ini_r > fim_r:
+        st.error("A data inicial não pode ser depois da data final.")
+    else:
+        df_rp = normalizar_pedidos(ler("pedidos"))
+        if df_rp.empty:
+            st.info("Ainda não há pedidos para o relatório.")
+        else:
+            df_rp["data_pedido"] = pd.to_datetime(df_rp["data_pedido"], errors="coerce").dt.date
+            periodo = df_rp[(df_rp["data_pedido"] >= ini_r) & (df_rp["data_pedido"] <= fim_r)]
+            aprov = periodo[periodo["status"].isin(STATUS_APROVADOS)].copy()
+
+            conversao = (len(aprov) / len(periodo) * 100.0) if len(periodo) else 0.0
+            fat = aprov["valor_final"].sum()
+            custos_prod = aprov["custo"].sum()
+            comissoes_tot = (aprov["valor_final"] * aprov["comissao_pct"] / 100.0 + aprov["taxa_fixa"]).sum()
+            recebido = (
+                aprov["entrada_valor"].where(aprov["entrada_paga"], 0.0)
+                + aprov["saldo_valor"].where(aprov["saldo_paga"], 0.0)
+            ).sum()
+            pendente = (
+                aprov["entrada_valor"].where(~aprov["entrada_paga"], 0.0)
+                + aprov["saldo_valor"].where(~aprov["saldo_paga"], 0.0)
+            ).sum()
+            comissoes_pagas = (
+                (aprov["entrada_valor"] * aprov["comissao_pct"] / 100.0 + aprov["taxa_fixa"] / 2.0).where(aprov["entrada_paga"], 0.0)
+                + (aprov["saldo_valor"] * aprov["comissao_pct"] / 100.0 + aprov["taxa_fixa"] / 2.0).where(aprov["saldo_paga"], 0.0)
+            ).sum()
+            custos_totais = custos_prod + comissoes_tot
+            lucro = fat - custos_totais
+            margem_real = (lucro / fat * 100.0) if fat > 0 else 0.0
+            horas_impressas = aprov.loc[aprov["status"].isin(STATUS_IMPRESSOS), "horas_impressao"].sum()
+
+            gramas_consumidas = 0.0
+            ids_baixados = [int(x) for x in aprov.loc[aprov["estoque_baixado"], "id"].tolist()]
+            if ids_baixados:
+                try:
+                    usos_rel = db.table("pedido_rolos").select("gramas_com_perda").in_("pedido_id", ids_baixados).execute().data
+                    gramas_consumidas = sum(num(u["gramas_com_perda"]) for u in usos_rel)
+                except Exception as erro:
+                    st.error(f"Não consegui somar o consumo de filamento: {erro}")
+
+            # ----- Barras de ponto de equilíbrio e meta -----
+            st.markdown("### 🎯 Ponto de equilíbrio e meta")
+            custo_fixo = f("custo_fixo_mensal")
+            meta_lucro = f("meta_lucro_mensal")
+            pct_equilibrio = (lucro / custo_fixo) if custo_fixo > 0 else 0.0
+            pct_meta = (lucro / meta_lucro) if meta_lucro > 0 else 0.0
+            st.progress(
+                min(max(pct_equilibrio, 0.0), 1.0),
+                text=f"Ponto de equilíbrio: {pct_equilibrio * 100:.0f}% dos custos fixos cobertos ({brl(lucro)} de {brl(custo_fixo)})",
+            )
+            st.progress(
+                min(max(pct_meta, 0.0), 1.0),
+                text=f"Meta de lucro mensal: {pct_meta * 100:.0f}% atingido ({brl(lucro)} de {brl(meta_lucro)})",
+            )
+            st.caption("Custo fixo e meta são valores mensais. Para uma leitura justa, use um período de 1 mês.")
+            if lucro < 0:
+                st.error("⚠️ Lucro negativo no período: os custos passaram do faturamento.")
+
+            # ----- Indicadores -----
+            st.markdown("### 💵 Resultado do período")
+            i1, i2 = st.columns(2)
+            i1.metric("Faturamento bruto", brl(fat))
+            i2.metric("Lucro líquido", brl(lucro))
+            i3, i4 = st.columns(2)
+            i3.metric("Recebido em caixa (bruto)", brl(recebido))
+            i4.metric("Pendente (50% a receber)", brl(pendente))
+            i5, i6 = st.columns(2)
+            i5.metric("Custos totais", brl(custos_totais))
+            i6.metric("Margem real", f"{margem_real:.1f}%")
+            i7, i8 = st.columns(2)
+            i7.metric("Comissões pagas (sobre o recebido)", brl(comissoes_pagas))
+            i8.metric("Conversão de orçamentos em pedidos", f"{conversao:.0f}%")
+            i9, i10 = st.columns(2)
+            i9.metric("Filamento consumido", f"{gramas_consumidas:.0f} g ({gramas_consumidas / 1000.0:.2f} kg)")
+            hi, mi = decimal_para_hm(horas_impressas)
+            i10.metric("Horas impressas", f"{hi}h{mi:02d}min")
+            st.caption(
+                f"Custos totais = custo de produção dos pedidos ({brl(custos_prod)}) + comissões e taxas dos canais ({brl(comissoes_tot)}). "
+                f"{len(aprov)} pedido(s) aprovado(s) de {len(periodo)} no período."
+            )
+
+            # ----- Gráficos -----
+            if aprov.empty:
+                st.info("Nenhum pedido aprovado neste período para montar os gráficos.")
+            else:
+                st.markdown("### 📌 Vendas por canal")
+                aprov["canal"] = aprov["canal"].fillna("").replace("", "(não informado)")
+                st.bar_chart(aprov.groupby("canal")["valor_final"].sum())
+
+                st.markdown("### 🏆 Ranking de melhores clientes")
+                aprov["cliente"] = aprov["cliente"].fillna("").replace("", "(sem nome)")
+                ranking = aprov.groupby("cliente")["valor_final"].sum().sort_values(ascending=False).head(10)
+                st.bar_chart(ranking)
+                ranking_tab = ranking.reset_index()
+                ranking_tab.columns = ["Cliente", "Total comprado"]
+                ranking_tab["Total comprado"] = ranking_tab["Total comprado"].apply(brl)
+                st.dataframe(ranking_tab, use_container_width=True, hide_index=True)
+
+            # ----- Caixa do período -----
+            st.markdown("### 💰 Caixa do período")
+            df_cx_rel = ler("fluxo_caixa")
+            if df_cx_rel.empty:
+                st.info("Nenhum lançamento no caixa ainda.")
+            else:
+                df_cx_rel["valor"] = pd.to_numeric(df_cx_rel["valor"], errors="coerce").fillna(0.0)
+                df_cx_rel["data"] = pd.to_datetime(df_cx_rel["data"], errors="coerce").dt.date
+                per_cx = df_cx_rel[(df_cx_rel["data"] >= ini_r) & (df_cx_rel["data"] <= fim_r)]
+                ent_cx = per_cx.loc[per_cx["tipo"] == "Entrada", "valor"].sum()
+                sai_cx = per_cx.loc[per_cx["tipo"] == "Saída", "valor"].sum()
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Entradas", brl(ent_cx))
+                k2.metric("Saídas", brl(sai_cx))
+                k3.metric("Resultado", brl(ent_cx - sai_cx))
+
+            botao_baixar(periodo, "pedidos_do_periodo", "bkp_relatorio")
+
+
+# =========================================================
+# FIM DO ARQUIVO
+# =========================================================
