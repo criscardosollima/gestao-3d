@@ -1338,3 +1338,54 @@ with tabs[4]:
                 if salvar_edicao:
                     try:
                         db.table("pedidos").update({
+                            "cliente": e_cli.strip(),
+                            "whatsapp": e_wpp.strip(),
+                            "previsao_entrega": e_prev.isoformat(),
+                            "responsavel": e_resp.strip(),
+                            "forma_pagamento": e_forma,
+                            "observacoes": e_obs.strip(),
+                        }).eq("id", pid).execute()
+                        st.session_state["flash"] = "Dados do pedido atualizados."
+                        st.rerun()
+                    except Exception as erro:
+                        st.error(f"Não consegui salvar: {erro}")
+
+            with st.expander("🗑️ Excluir este pedido"):
+                st.caption("Só é possível se nenhum pagamento tiver sido registrado. Para mudar quantidade ou valores, exclua e crie de novo.")
+                confirma_del = st.checkbox("Confirmo que quero excluir este pedido", key=f"del_conf_{pid}")
+                if st.button("Excluir pedido", disabled=not confirma_del, key=f"del_btn_{pid}"):
+                    if bool(ped["entrada_paga"]) or bool(ped["saldo_paga"]):
+                        st.error("Este pedido tem pagamento registrado. Estorne os pagamentos antes de excluir.")
+                    else:
+                        try:
+                            if bool(ped["estoque_baixado"]):
+                                devolver_estoque(pid)
+                            db.table("pedidos").delete().eq("id", pid).execute()
+                            st.session_state["flash"] = "Pedido excluído (e filamento devolvido, se havia sido baixado)."
+                            st.rerun()
+                        except Exception as erro:
+                            st.error(f"Não consegui excluir: {erro}")
+
+    # =====================================================
+    # VISÃO: CRM — HISTÓRICO DE CLIENTES
+    # =====================================================
+    elif visao == V_CRM:
+        if df_ped.empty:
+            st.info("Ainda não há pedidos.")
+        else:
+            aprov_crm = df_ped[df_ped["status"].isin(STATUS_APROVADOS)].copy()
+            if aprov_crm.empty:
+                st.info("Ainda não há pedidos aprovados. Clientes aparecem aqui depois que o primeiro pedido for aprovado.")
+            else:
+                aprov_crm["cliente"] = aprov_crm["cliente"].fillna("").replace("", "(sem nome)")
+                crm = (
+                    aprov_crm.groupby("cliente")
+                    .agg(WhatsApp=("whatsapp", "last"), Pedidos=("codigo", "count"), Total=("valor_final", "sum"))
+                    .reset_index()
+                    .sort_values("Total", ascending=False)
+                )
+                crm = crm.rename(columns={"cliente": "Cliente", "Pedidos": "Pedidos aprovados", "Total": "Total gasto (R$)"})
+                exibir_crm = crm.copy()
+                exibir_crm["Total gasto (R$)"] = exibir_crm["Total gasto (R$)"].apply(brl)
+                st.dataframe(exibir_crm, use_container_width=True, hide_index=True)
+                botao_baixar(crm, "clientes", "bkp_clientes")
